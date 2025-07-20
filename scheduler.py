@@ -47,7 +47,7 @@ class BaseScheduler(ABC):
 def mask_by_random_topk(mask_len, probs, temperature=1.0):
     mask_len = mask_len.squeeze()
     confidence = torch.log(probs) + torch.Tensor(temperature * np.random.gumbel(size=probs.shape)).cuda()
-    sorted_confidence, _ = torch.sort(confidence, axis=-1)
+    sorted_confidence, _ = torch.sort(confidence, axis=-1) # type: ignore
     # Obtains cut off threshold given the mask lengths.
     cut_off = sorted_confidence[:, mask_len.long()-1:mask_len.long()]
     # Masks tokens with lower confidence.
@@ -72,7 +72,7 @@ def sum_masked_logits(
     """
     B, T, C = logits.shape
     # Ensure preds are in valid index range [0, C-1]
-    valid = (preds >= 0) & (preds < C)
+    valid = (preds >= 0) & (preds <= preds[mask].max())
     # Replace invalid preds with a dummy index (0), which we will mask later
     safe_preds = preds.masked_fill(~valid, 0)
     # Gather logits at predicted indices
@@ -81,6 +81,16 @@ def sum_masked_logits(
     selected = selected * valid * mask
     # Sum over time dimension
     return selected.sum(dim=1)
+
+def log1mexp(x: torch.Tensor) -> torch.Tensor:
+    """
+    Numerically stable computation of log(1 - exp(x)) for x < 0.
+    """
+    return torch.where(
+        x > -1,
+        torch.log(-torch.expm1(x)),
+        torch.log1p(-torch.exp(x)),
+    )
 
 
 class MageScheduler(BaseScheduler):
@@ -156,6 +166,7 @@ class MageScheduler(BaseScheduler):
         new_latents = sched_out.new_latents
         
         newly_filled_positions = (latents != new_latents)
+        print("Newly filled positions:", newly_filled_positions.sum(dim=1))
         
         log_prob_proposal = sum_masked_logits(
             logits=proposal_logits.log_softmax(dim=-1),
@@ -167,6 +178,8 @@ class MageScheduler(BaseScheduler):
             preds=new_latents,
             mask=newly_filled_positions,
         )
+        print("log prob proposal:", log_prob_proposal)
+        print("log prob diffusion:", log_prob_diffusion)
         return SchedulerApproxGuidanceOutput(
             new_latents,
             log_prob_proposal,
@@ -175,8 +188,28 @@ class MageScheduler(BaseScheduler):
 
 
 class ReMDMScheduler(BaseScheduler):
-    def __init__(self, ):
-        pass
+    def __init__(
+        self,
+        schedule,
+        remask_strategy,
+        eta,
+        mask_token_id,
+        temperature=1.0,
+    ):
+        self.schedule = schedule
+        self.remask_strategy = remask_strategy
+        self.eta = eta 
+        self.temperature = temperature
+        self.mask_token_id = mask_token_id
+    
+    def set_timesteps(self, num_inference_steps: int):
+        self.num_inference_steps = num_inference_steps
+        if self.schedule == "linear":
+            self.alphas = 1 - torch.linspace(0, 1, num_inference_steps + 1)
+        elif self.schedule == "cosine":
+            self.alphas = 1 - torch.cos((math.pi/2) * (1 - torch.linspace(0, 1, num_inference_steps + 1)))
+        else:
+            raise ValueError(f"unknown masking schedule {self.schedule}")
     
     def step(
         self,
@@ -184,7 +217,53 @@ class ReMDMScheduler(BaseScheduler):
         step: int,
         logits: torch.Tensor,
     ) -> SchedulerStepOutput:
-        pass
+        B, L, C = logits.shape
+        assert latents.shape == (B, L)
+        
+        t = self.num_inference_steps - step
+        s = t - 1
+        
+        alpha_t = self.alphas[t]
+        alpha_s = self.alphas[s]
+        sigma_t_max = torch.clamp_max((1 - alpha_s) / alpha_t, 1.0)
+        if self.remask_strategy == "max_cap":
+            sigma_t = torch.clamp_max(sigma_t_max, self.eta)
+        elif self.remask_strategy == "rescale":
+            sigma_t = sigma_t_max * self.eta
+        else:
+            raise ValueError(f"unknown masking schedule {self.remask_strategy}")
+        
+        # z_t != m
+        x_theta = F.one_hot(latents, num_classes=C).float()
+        logits_z_t_neq_m = (
+            torch.log(x_theta) +
+            torch.log(1 - sigma_t)
+        )
+        logits_z_t_neq_m[..., self.mask_token_id] = (
+            torch.log(sigma_t)
+        )
+        
+        # z_t = m
+        log_x_theta = (logits / self.temperature).log_softmax(dim=-1)
+        logits_z_t_eq_m = (
+            log_x_theta + 
+            torch.log((alpha_s - (1 - sigma_t) * alpha_t) / (1 - alpha_t))
+        )
+        logits_z_t_eq_m[..., self.mask_token_id] = (
+            torch.log((1 - alpha_s - sigma_t * alpha_t) / (1 - alpha_t))
+        )
+        
+        z_t_neq_m = (latents != self.mask_token_id)
+        p_theta_logits = torch.where(
+            z_t_neq_m.unsqueeze(-1).expand(-1, -1, C),
+            logits_z_t_neq_m,
+            logits_z_t_eq_m,
+        )
+        assert torch.allclose(torch.exp(p_theta_logits).sum(dim=-1), torch.ones(B, L, device=logits.device)), (torch.exp(p_theta_logits).sum(dim=-1) - torch.ones(B, L, device=logits.device)).abs().max()
+        diffusion_dist = torch.distributions.Categorical(logits=p_theta_logits) # type: ignore
+        new_latents = diffusion_dist.sample()
+        print("Unmasked:", (new_latents != self.mask_token_id).sum(dim=1))
+        return SchedulerStepOutput(new_latents)
     
     def step_with_approx_guidance(
         self,
@@ -193,4 +272,82 @@ class ReMDMScheduler(BaseScheduler):
         logits: torch.Tensor,
         approx_guidance: torch.Tensor,
     ) -> SchedulerApproxGuidanceOutput:
-        pass
+        B, L, C = logits.shape
+        assert latents.shape == (B, L)
+        assert approx_guidance.shape == (B, L, C)
+        
+        t = self.num_inference_steps - step
+        s = t - 1
+        
+        alpha_t = self.alphas[t]
+        alpha_s = self.alphas[s]
+        sigma_t_max = torch.clamp_max((1 - alpha_s) / alpha_t, 1.0)
+        if self.remask_strategy == "max_cap":
+            sigma_t = torch.clamp_max(sigma_t_max, self.eta)
+        elif self.remask_strategy == "rescale":
+            sigma_t = sigma_t_max * self.eta
+        else:
+            raise ValueError(f"unknown masking schedule {self.remask_strategy}")
+        
+        # z_t != m
+        x_theta = F.one_hot(latents, num_classes=C).float()
+        logits_z_t_neq_m = (
+            torch.log(x_theta) +
+            torch.log(1 - sigma_t)
+        )
+        logits_z_t_neq_m[..., self.mask_token_id] = (
+            torch.log(sigma_t)
+        )
+        
+        # z_t = m
+        log_x_theta = (logits / self.temperature).log_softmax(dim=-1)
+        logits_z_t_eq_m = (
+            log_x_theta + 
+            torch.log((alpha_s - (1 - sigma_t) * alpha_t) / (1 - alpha_t))
+        )
+        logits_z_t_eq_m[..., self.mask_token_id] = (
+            torch.log((1 - alpha_s - sigma_t * alpha_t) / (1 - alpha_t))
+        )
+        
+        z_t_neq_m = (latents != self.mask_token_id)
+        p_theta_logits = torch.where(
+            z_t_neq_m.unsqueeze(-1).expand(-1, -1, C),
+            logits_z_t_neq_m,
+            logits_z_t_eq_m,
+        )
+        assert torch.allclose(torch.exp(p_theta_logits).sum(dim=-1), torch.ones(B, L, device=logits.device))
+        
+        proposal_logits = (p_theta_logits + approx_guidance).log_softmax(dim=-1)
+        assert torch.allclose(torch.exp(proposal_logits).sum(dim=-1), torch.ones(B, L, device=logits.device))
+        
+        # modify proposal logits to have the same mask schedule as the original logits
+        proposal_logits[..., :self.mask_token_id] += (
+            torch.logsumexp(p_theta_logits[..., :self.mask_token_id], dim=(1, 2), keepdim=True) - 
+            torch.logsumexp(proposal_logits[..., :self.mask_token_id], dim=(1, 2), keepdim=True)
+        )
+        proposal_logits[..., :self.mask_token_id] = torch.where(
+            proposal_logits[..., :self.mask_token_id].logsumexp(dim=-1, keepdim=True) >= 0,
+            proposal_logits[..., :self.mask_token_id].log_softmax(dim=-1),
+            proposal_logits[..., :self.mask_token_id]
+        )
+        assert not (proposal_logits[..., :self.mask_token_id].logsumexp(dim=-1) > 1e-6).any(), proposal_logits[..., :self.mask_token_id].logsumexp(dim=-1).max()
+        proposal_logits[..., self.mask_token_id] = (
+            log1mexp(proposal_logits[..., :self.mask_token_id].logsumexp(dim=-1).clamp_max(0))
+        )
+        assert torch.allclose(torch.exp(proposal_logits).sum(dim=-1), torch.ones(B, L, device=logits.device)), (torch.exp(proposal_logits).sum(dim=-1) - torch.ones(B, L, device=logits.device)).abs().max()
+        # modify proposal logits to have the same mask schedule as the original logits
+        
+        proposal_dist = torch.distributions.Categorical(logits=proposal_logits) # type: ignore
+        diffusion_dist = torch.distributions.Categorical(logits=p_theta_logits) # type: ignore
+        
+        new_latents = proposal_dist.sample()
+        
+        log_prob_proposal = proposal_dist.log_prob(new_latents).sum(dim=1)
+        log_prob_diffusion = diffusion_dist.log_prob(new_latents).sum(dim=1)
+        
+        print("Unmasked:", (new_latents != self.mask_token_id).sum(dim=1))
+        return SchedulerApproxGuidanceOutput(
+            new_latents,
+            log_prob_proposal,
+            log_prob_diffusion,
+        )

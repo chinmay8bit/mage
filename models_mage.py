@@ -114,7 +114,11 @@ class BertEmbeddings(nn.Module):
 
         position_ids = self.position_ids[:, :seq_length]
 
-        inputs_embeds = self.word_embeddings(input_ids)
+        # Add handling for one hot input ids
+        if torch.is_floating_point(input_ids):
+            inputs_embeds = input_ids @ self.word_embeddings.weight
+        else:
+            inputs_embeds = self.word_embeddings(input_ids)
 
         position_embeddings = self.position_embeddings(position_ids)
         embeddings = inputs_embeds + position_embeddings

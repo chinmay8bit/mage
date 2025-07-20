@@ -2,7 +2,7 @@ import torch
 
 import models_mage
 from pipeline import Pipeline
-from scheduler import MageScheduler
+from scheduler import MageScheduler, ReMDMScheduler
 from plot_utils import show_images_grid
 
 
@@ -23,10 +23,21 @@ checkpoint = torch.load(model_ckpt, map_location='cpu')
 model.load_state_dict(checkpoint['model'])
 model.eval()
 
-scheduler = MageScheduler(
-    mask_token_id = model.mask_token_label,
-    choice_temperature=6.0,
-)
+use_remdm = False
+
+if use_remdm:
+    scheduler = ReMDMScheduler(
+        schedule="cosine", 
+        remask_strategy="rescale",
+        eta=0.1,
+        mask_token_id=model.mask_token_label,
+        temperature=1.0,
+    )
+else:
+    scheduler = MageScheduler(
+        mask_token_id = model.mask_token_label,
+        choice_temperature=6.0,
+    )
 
 pipe = Pipeline(
     model=model,
@@ -37,8 +48,10 @@ pipe = Pipeline(
     use_mixed_precision=False,
 )
 
+# For class unconditional generation, we choose τ = 6.0
+# and T = 20 to generate images in our experiment.
 images = pipe(
-    num_inference_steps=10,
+    num_inference_steps=200,
     disable_progress_bar=False,
     num_particles=8,   
 )

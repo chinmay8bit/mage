@@ -55,7 +55,8 @@ class Pipeline():
 
             # decoder
             logits = self.model.forward_decoder(x, token_drop_mask, token_all_mask)
-            logits = logits[:, 1:, :self.codebook_size]
+            logits = logits[:, 1:, :]
+            logits[..., self.codebook_size:] = float('-inf')
             
             sched_out = self.scheduler.step(latents, step, logits)
             latents = sched_out.new_latents
